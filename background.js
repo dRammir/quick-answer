@@ -263,24 +263,62 @@ function waitForTabComplete(tabId, timeoutMs) {
   });
 }
 
-async function findOrOpenChatTab() {
-  const tabs = await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' });
-  let tab = tabs.find((item) => item.status === 'complete') || tabs[0] || null;
+function isUsableChatUrl(url) {
+  try {
+    const parsed = new URL(url);
+    if (!/(^|\.)chat\.deepseek\.com$/i.test(parsed.hostname)) return false;
+    return !/^\/(?:sign_in|login|share)(?:\/|$)/i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+async function restoreFocus(originTabId) {
+  if (!originTabId) return;
+  try {
+    const tab = await chrome.tabs.get(originTabId);
+    await chrome.tabs.update(originTabId, { active: true });
+    if (tab?.windowId != null) {
+      await chrome.windows.update(tab.windowId, { focused: true });
+    }
+  } catch {
+    /* вкладку могли закрыть */
+  }
+}
+
+async function findOrOpenChatTab(originTabId) {
+  const tabs = (await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' }))
+    .filter((item) => isUsableChatUrl(item.url))
+    .sort(
+      (a, b) =>
+        Number(Boolean(b.active)) - Number(Boolean(a.active)) ||
+        (b.lastAccessed || 0) - (a.lastAccessed || 0),
+    );
+  let tab = tabs[0] || null;
 
   if (tab) {
     if (tab.status !== 'complete') tab = await waitForTabComplete(tab.id, 40_000);
-    try {
-      await chrome.tabs.update(tab.id, { active: false });
-    } catch {
-      /* вкладку могли закрыть */
+
+    if (tab.discarded) {
+      // «Спящую» вкладку нужно активировать, иначе её DOM не отрисован.
+      await chrome.tabs.update(tab.id, { active: true });
+      tab = await waitForTabComplete(tab.id, 40_000);
+      return { tab, restore: true };
     }
-    return { tab, opened: false };
+    return { tab, restore: false };
   }
 
-  const created = await chrome.tabs.create({ url: WEB_TAB_URL, active: false });
-  const ready = await waitForTabComplete(created.id, 40_000);
-  await sleep(1_800); // даём React-приложению дорисовать редактор
-  return { tab: ready, opened: true };
+  // Новую вкладку открываем активной: CloudFront/React успевают
+  // отрисовать страницу и поле ввода. Куда вернуть фокус — решает caller.
+  const created = await chrome.tabs.create({ url: WEB_TAB_URL, active: true });
+  try {
+    const ready = await waitForTabComplete(created.id, 40_000);
+    await sleep(1_800); // даём React-приложению дорисовать редактор
+    return { tab: ready, restore: true };
+  } catch (error) {
+    await restoreFocus(originTabId);
+    throw error;
+  }
 }
 
 async function sendToChatTab(tabId, message) {
@@ -302,48 +340,52 @@ async function sendToChatTab(tabId, message) {
   }
 }
 
-async function askViaWeb(settings, text) {
-  const { tab } = await findOrOpenChatTab();
+async function askViaWeb(settings, text, originTabId) {
+  const { tab, restore } = await findOrOpenChatTab(originTabId);
 
-  const prompt = buildWebPrompt(text, settings.systemPrompt);
-  let response;
   try {
-    response = await withTimeout(
-      sendToChatTab(tab.id, { type: 'dsq-web-ask', prompt }),
-      WEB_TIMEOUT_MS,
-      'Веб-вкладка не ответила за 150 секунд. Проверьте, что вы вошли в chat.deepseek.com.',
-    );
-  } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err));
-    if (!error.code) error.code = 'WEB_TIMEOUT';
-    throw error;
-  }
+    const prompt = buildWebPrompt(text, settings.systemPrompt);
+    let response;
+    try {
+      response = await withTimeout(
+        sendToChatTab(tab.id, { type: 'dsq-web-ask', prompt }),
+        WEB_TIMEOUT_MS,
+        'Веб-вкладка не ответила за 150 секунд. Проверьте, что вы вошли в chat.deepseek.com.',
+      );
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      if (!error.code) error.code = 'WEB_TIMEOUT';
+      throw error;
+    }
 
-  if (!response) {
-    const error = new Error('Вкладка chat.deepseek.com не вернула ответ. Обновите её и попробуйте снова.');
-    error.code = 'WEB_ERROR';
-    throw error;
-  }
-  if (!response.ok) {
-    const error = new Error(response.error || 'Не удалось получить ответ в chat.deepseek.com.');
-    error.code = response.code || 'WEB_ERROR';
-    throw error;
-  }
+    if (!response) {
+      const error = new Error('Вкладка chat.deepseek.com не вернула ответ. Обновите её и попробуйте снова.');
+      error.code = 'WEB_ERROR';
+      throw error;
+    }
+    if (!response.ok) {
+      const error = new Error(response.error || 'Не удалось получить ответ в chat.deepseek.com.');
+      error.code = response.code || 'WEB_ERROR';
+      throw error;
+    }
 
-  const content = String(response.text || '').trim();
-  if (!content) {
-    const error = new Error('DeepSeek вернул пустой ответ в чате. Попробуйте повторить.');
-    error.code = 'WEB_ERROR';
-    throw error;
+    const content = String(response.text || '').trim();
+    if (!content) {
+      const error = new Error('DeepSeek вернул пустой ответ в чате. Попробуйте повторить.');
+      error.code = 'WEB_ERROR';
+      throw error;
+    }
+    return { content };
+  } finally {
+    if (restore) await restoreFocus(originTabId);
   }
-  return { content };
 }
 
 /* ------------------------------------------------------------------ */
 /* Основной сценарий                                                   */
 /* ------------------------------------------------------------------ */
 
-async function handleAsk(rawText) {
+async function handleAsk(rawText, originTabId) {
   const settings = await getSettings();
   const { text } = clampQuestion(rawText, settings.maxChars);
   if (!text) {
@@ -361,7 +403,8 @@ async function handleAsk(rawText) {
   try {
     for (const backend of backends) {
       try {
-        const result = backend === 'api' ? await askViaApi(settings, text) : await askViaWeb(settings, text);
+        const result =
+          backend === 'api' ? await askViaApi(settings, text) : await askViaWeb(settings, text, originTabId);
         const numbers = extractAnswerNumbers(result.content, text);
         return {
           ok: true,
@@ -458,8 +501,9 @@ function reply(sendResponse, promise) {
   return true;
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object' || message.target === 'offscreen') return false;
+  const originTabId = sender?.tab?.id;
 
   switch (message.type) {
     case 'dsq-ping':
@@ -474,7 +518,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ ok: false, error: 'Не передан текст вопроса.' });
         return false;
       }
-      return reply(sendResponse, handleAsk(message.text));
+      return reply(sendResponse, handleAsk(message.text, originTabId));
     }
 
     case 'dsq-test-key':

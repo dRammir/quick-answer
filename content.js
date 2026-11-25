@@ -81,8 +81,28 @@
       return error;
     };
 
+    const debug = (...args) => {
+      try {
+        console.info('[DSQ][web]', ...args);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    function isChallengePage() {
+      // Если поле ввода уже есть, это точно не страница блокировки —
+      // даже если в переписке обсуждаются ошибки 403.
+      if (document.querySelector('#chat-input, textarea, [contenteditable="true"]')) return false;
+      const text = `${document.title} ${(document.body?.innerText || '').slice(0, 800)}`;
+      return /Request blocked|could not be satisfied|403 ERROR|Just a moment|Checking your browser|Verify you are human/i.test(
+        text,
+      );
+    }
+
     function findEditor() {
       const candidates = [
+        document.querySelector('#chat-input'),
+        document.querySelector('[data-testid="chat-input"]'),
         document.querySelector('textarea#chat-input'),
         document.querySelector('textarea[placeholder]'),
         document.querySelector('div[contenteditable="true"][role="textbox"]'),
@@ -111,14 +131,18 @@
       });
 
       const explicit = near.find((element) =>
-        /send|отправ/i.test(`${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''}`),
+        /send|отправ/i.test(
+          `${element.getAttribute('aria-label') || ''} ${element.getAttribute('title') || ''} ${
+            element.getAttribute('data-testid') || ''
+          }`,
+        ),
       );
       if (explicit) return explicit;
 
       // Если рядом ничего не нашли — ищем явную кнопку Send по всему документу.
       const globalExplicit = Array.from(
         document.querySelectorAll(
-          'button[aria-label*="send" i], div[role="button"][aria-label*="send" i], button[type="submit"]',
+          'button[aria-label*="send" i], div[role="button"][aria-label*="send" i], button[type="submit"], button[data-testid="send-button"], [role="button"][data-testid="send-button"]',
         ),
       ).filter(
         (element) =>
@@ -204,29 +228,45 @@
     async function submitPrompt(editor) {
       const button = findSendButton(editor);
       if (button) {
-        await waitFor(() => !isDisabled(button), 4_000);
+        debug('send-button', {
+          tag: button.tagName,
+          testid: button.getAttribute('data-testid') || '',
+          label: `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''}`.trim(),
+        });
+        await waitFor(() => !isDisabled(button), 5_000);
         button.click();
       } else {
+        debug('send-enter');
         pressEnter(editor);
       }
 
-      let cleared = await waitFor(() => isEditorEmpty(editor), 4_000);
+      let cleared = await waitFor(() => isEditorEmpty(editor), 5_000);
       if (!cleared) {
         pressEnter(editor);
         cleared = await waitFor(() => isEditorEmpty(editor), 3_000);
       }
       if (!cleared) {
         throw errorWithCode(
-          'Не удалось отправить вопрос в чат DeepSeek. Откройте вкладку и попробуйте вручную один раз.',
+          'Вопрос вставился, но не отправился. Откройте chat.deepseek.com и отправьте его вручную, затем повторите.',
           'WEB_SUBMIT',
         );
       }
+      debug('sent');
     }
 
     function collectAssistantBlocks() {
       const nodes = new Set();
-      for (const selector of ['div.ds-markdown', '[class*="ds-markdown"]', '[class*="markdown"]']) {
+      for (const selector of [
+        'div.ds-markdown.ds-markdown--block',
+        'div.ds-markdown',
+        '[class*="ds-markdown"]',
+        '[class*="markdown"]',
+      ]) {
         document.querySelectorAll(selector).forEach((node) => nodes.add(node));
+      }
+      // Запасной вариант, если классы markdown уже другие.
+      if (nodes.size === 0) {
+        document.querySelectorAll('[data-message-author-role="assistant"]').forEach((node) => nodes.add(node));
       }
       const all = Array.from(nodes);
       return all
@@ -273,6 +313,7 @@
       let lastText = '';
       let stableSince = 0;
       let sawFresh = false;
+      debug('waiting-answer', { baseline: baseline.count });
 
       while (Date.now() - started < timeoutMs) {
         const blocks = collectAssistantBlocks();
@@ -283,6 +324,7 @@
             (index >= baseline.count || !baseline.texts.has(item.text)) && !isEcho(item.text, prompt),
         );
         if (fresh.length) {
+          if (!sawFresh) debug('answer-started');
           sawFresh = true;
           const latest = fresh[fresh.length - 1];
           if (latest.text !== lastText) {
@@ -295,14 +337,19 @@
 
         const stableFor = Date.now() - stableSince;
         if (sawFresh && lastText && ((!isGenerating() && stableFor >= 2_500) || stableFor >= 8_000)) {
+          debug('answer-ready', { chars: lastText.length });
           return lastText;
         }
         await sleep(400);
       }
 
-      if (sawFresh && lastText) return lastText;
+      if (sawFresh && lastText) {
+        debug('answer-timeout-partial', { chars: lastText.length });
+        return lastText;
+      }
+      debug('timeout', { blocks: collectAssistantBlocks().length });
       throw errorWithCode(
-        'DeepSeek не прислал ответ за 150 секунд. Проверьте вкладку chat.deepseek.com — возможно, нужен вход в аккаунт.',
+        'DeepSeek не прислал ответ за 150 секунд. Проверьте, что вопрос появился в чате, вы вошли в аккаунт и сайт не показывает проверку.',
         'WEB_TIMEOUT',
       );
     }
@@ -313,6 +360,13 @@
       }
       if (busy) {
         throw errorWithCode('Предыдущий запрос в чате ещё выполняется. Подождите немного.', 'WEB_BUSY');
+      }
+      debug('start', location.pathname);
+      if (isChallengePage()) {
+        throw errorWithCode(
+          'chat.deepseek.com показывает проверку CloudFront. Откройте вкладку, пройдите проверку и повторите.',
+          'WEB_BLOCKED',
+        );
       }
       if (/\/sign_in|\/login/i.test(location.pathname)) {
         throw errorWithCode(
@@ -326,10 +380,11 @@
         const editor = await waitFor(findEditor, 25_000, 300);
         if (!editor) {
           throw errorWithCode(
-            'Не нашёл поле ввода на chat.deepseek.com. Войдите в аккаунт и обновите вкладку.',
+            'Не нашёл поле ввода на chat.deepseek.com. Убедитесь, что вы вошли в аккаунт, страница не на экране входа, и обновите вкладку.',
             'WEB_EDITOR',
           );
         }
+        debug('editor', { tag: editor.tagName, id: editor.id || '' });
 
         const baselineBlocks = collectAssistantBlocks();
         const baseline = {
@@ -337,6 +392,7 @@
           texts: new Set(baselineBlocks.map((item) => item.text)),
         };
         await insertPrompt(editor, prompt);
+        debug('inserted', { tag: editor.tagName, chars: (editor.value || editor.innerText || '').length });
         await sleep(300);
         await submitPrompt(editor);
         return await waitForAnswer(baseline, prompt, 140_000);
@@ -357,13 +413,14 @@
 
       handleWebAsk(message.prompt)
         .then((text) => sendResponse({ ok: true, text }))
-        .catch((error) =>
+        .catch((error) => {
+          debug('error', { code: error?.code || 'WEB_ERROR', message: error?.message || String(error) });
           sendResponse({
             ok: false,
             error: error?.message || String(error),
             code: error?.code || 'WEB_ERROR',
-          }),
-        );
+          });
+        });
       return true;
     });
   }
@@ -579,9 +636,10 @@
       try {
         text = String(await grabClipboard()).trim();
       } catch (err) {
+        console.warn('[DSQ] clipboard:', err?.message || err);
         showNumbers([], {
           kind: 'error',
-          holdMs: 6_000,
+          holdMs: 12_000,
           title: err?.message || 'Не удалось прочитать буфер обмена.',
         });
         return;
@@ -590,7 +648,7 @@
       if (!text) {
         showNumbers([], {
           kind: 'warn',
-          holdMs: 4_500,
+          holdMs: 8_000,
           title: 'Буфер обмена пуст — скопируйте вопрос с вариантами.',
         });
         return;
@@ -598,9 +656,10 @@
 
       const result = await send({ type: 'dsq-ask', text });
       if (!result?.ok) {
+        console.warn('[DSQ] ask:', result?.error || 'no response');
         showNumbers([], {
           kind: 'error',
-          holdMs: 7_000,
+          holdMs: 15_000,
           title: result?.error || 'DeepSeek не ответил. Попробуйте ещё раз.',
         });
         return;
@@ -610,16 +669,18 @@
       if (values.length) {
         showNumbers(values, { kind: 'answer', holdMs: 15_000 });
       } else {
+        console.warn('[DSQ] no numbers in answer');
         showNumbers([], {
           kind: 'warn',
-          holdMs: 8_000,
+          holdMs: 12_000,
           title: result.raw ? `Ответ без номера: ${String(result.raw).slice(0, 300)}` : 'Не удалось определить номер ответа.',
         });
       }
     } catch (err) {
+      console.warn('[DSQ] ask failed:', err?.message || err);
       showNumbers([], {
         kind: 'error',
-        holdMs: 7_000,
+        holdMs: 15_000,
         title: err?.message || 'Ошибка DeepSeek.',
       });
     } finally {
