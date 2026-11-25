@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "DeepSeek Quick Answer",
   "short_name": "DS Quick",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Помощник для сверки ответов: маленький квадрат в углу сайта отправляет вопрос из буфера в DeepSeek и показывает номер правильного варианта.",
   "minimum_chrome_version": "116",
   "permissions": ["storage", "clipboardRead", "offscreen", "tabs", "scripting"],

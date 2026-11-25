@@ -39,7 +39,7 @@
     if (!element) return true;
     if (element.disabled === true) return true;
     if (element.getAttribute('aria-disabled') === 'true') return true;
-    if (element.classList?.contains('disabled')) return true;
+    if (/disabled/i.test(String(element.className || ''))) return true;
     const style = getComputedStyle(element);
     return style.pointerEvents === 'none' || style.display === 'none' || style.visibility === 'hidden';
   }
@@ -124,8 +124,71 @@
       ).length;
     }
 
+    let pageLength = -1;
+    let pageStableSince = Date.now();
+    let lastPageSample = 0;
+
+    function samplePageStability() {
+      const now = Date.now();
+      if (now - lastPageSample < 500) return;
+      lastPageSample = now;
+      const length = (document.body?.textContent || '').length;
+      if (length !== pageLength) {
+        pageLength = length;
+        pageStableSince = now;
+      }
+    }
+
+    function isPageIdle() {
+      return Date.now() - pageStableSince >= 1_800;
+    }
+
+    async function waitForPageIdle(timeoutMs) {
+      const started = Date.now();
+      while (Date.now() - started < timeoutMs) {
+        samplePageStability();
+        if (isPageIdle()) return true;
+        await sleep(250);
+      }
+      return false;
+    }
+
+    function isComposerBusy(editor) {
+      if (!editor) return false;
+      if (editor.disabled || editor.readOnly || editor.getAttribute('aria-disabled') === 'true') {
+        return true;
+      }
+      return isGenerating();
+    }
+
     function findSendButton(editor) {
       const rect = editor.getBoundingClientRect();
+
+      // Основная кнопка DeepSeek — div[role=button].ds-button--primary
+      // (у кнопки отправки ещё и ds-button--circle), без aria-label.
+      const isNearEditor = (element) => {
+        const box = element.getBoundingClientRect();
+        return (
+          box.top >= rect.top - 24 &&
+          box.top <= rect.bottom + 160 &&
+          box.left >= rect.left - 60
+        );
+      };
+      const preferred = Array.from(
+        document.querySelectorAll(
+          '[role="button"].ds-button--primary.ds-button--circle, [role="button"][class*="ds-button--primary"][class*="circle"], [role="button"].ds-button--primary',
+        ),
+      ).filter(
+        (element) =>
+          element !== editor &&
+          !element.contains(editor) &&
+          !editor.contains(element) &&
+          isVisible(element) &&
+          !isDisabled(element) &&
+          isNearEditor(element),
+      );
+      if (preferred.length) return preferred[preferred.length - 1];
+
       const all = Array.from(document.querySelectorAll('button, div[role="button"]'));
       const near = all.filter((element) => {
         if (element === editor || element.contains(editor) || editor.contains(element)) return false;
@@ -457,7 +520,7 @@
       return candidates.length ? candidates[candidates.length - 1].text : '';
     }
 
-    async function waitForAnswer(baseline, prompt, timeoutMs) {
+    async function waitForAnswer(baseline, prompt, timeoutMs, editor) {
       const started = Date.now();
       let lastText = '';
       let stableSince = 0;
@@ -470,14 +533,24 @@
       debug('waiting-answer', { baseline: baseline.count });
 
       while (Date.now() - started < timeoutMs) {
+        samplePageStability();
         const blocks = collectAssistantBlocks();
         const pageAnswer = findAnswerInPage(prompt, baseline);
         if (pageAnswer) {
           if (pageAnswer !== patternText) {
             patternText = pageAnswer;
             patternSince = Date.now();
-          } else if (Date.now() - patternSince >= 1_500) {
-            debug('answer-pattern', { chars: pageAnswer.length });
+          } else if (
+            (Date.now() - patternSince >= 2_000 &&
+              isPageIdle() &&
+              !isComposerBusy(editor)) ||
+            Date.now() - patternSince >= 20_000
+          ) {
+            debug('answer-pattern', {
+              chars: pageAnswer.length,
+              pageIdle: isPageIdle(),
+              emergency: Date.now() - patternSince >= 20_000,
+            });
             return pageAnswer;
           }
         }
@@ -500,8 +573,12 @@
         }
 
         const stableFor = Date.now() - stableSince;
-        if (sawFresh && lastText && ((!isGenerating() && stableFor >= 2_500) || stableFor >= 8_000)) {
-          debug('answer-ready', { chars: lastText.length });
+        if (
+          sawFresh &&
+          lastText &&
+          ((stableFor >= 2_500 && isPageIdle() && !isComposerBusy(editor)) || stableFor >= 20_000)
+        ) {
+          debug('answer-ready', { chars: lastText.length, pageIdle: isPageIdle() });
           return lastText;
         }
 
@@ -511,8 +588,17 @@
             if (candidate !== fallbackText) {
               fallbackText = candidate;
               fallbackSince = Date.now();
-            } else if (Date.now() - fallbackSince >= 2_500) {
-              debug('answer-fallback-text', { chars: candidate.length });
+            } else if (
+              (Date.now() - fallbackSince >= 2_500 &&
+                isPageIdle() &&
+                !isComposerBusy(editor)) ||
+              Date.now() - fallbackSince >= 20_000
+            ) {
+              debug('answer-fallback-text', {
+                chars: candidate.length,
+                pageIdle: isPageIdle(),
+                emergency: Date.now() - fallbackSince >= 20_000,
+              });
               return candidate;
             }
           }
@@ -574,6 +660,16 @@
         }
         debug('editor', { tag: editor.tagName, id: editor.id || '' });
 
+        if (isComposerBusy(editor)) {
+          const ready = await waitFor(() => !isComposerBusy(editor), 12_000, 300);
+          debug('preflight-composer', Boolean(ready));
+        }
+        samplePageStability();
+        if (!isPageIdle()) {
+          const idle = await waitForPageIdle(20_000);
+          debug('preflight-page-idle', idle);
+        }
+
         const baselineBlocks = collectAssistantBlocks();
         const baseline = {
           count: baselineBlocks.length,
@@ -584,7 +680,7 @@
         await sleep(300);
         const sent = await submitPrompt(editor, prompt);
         // Если отправку не подтвердили, ждём меньше: вероятно, сообщение не ушло.
-        return await waitForAnswer(baseline, prompt, sent ? 180_000 : 60_000);
+        return await waitForAnswer(baseline, prompt, sent ? 180_000 : 60_000, editor);
       } finally {
         busy = false;
       }

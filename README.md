@@ -6,7 +6,7 @@
 понять, где ошибка.
 
 **Репозиторий:** <https://github.com/dRammir/quick-answer> · готовая сборка лежит в
-[`dist/deepseek-quick-answer-1.1.0.zip`](dist/deepseek-quick-answer-1.1.0.zip).
+[`dist/deepseek-quick-answer-1.1.1.zip`](dist/deepseek-quick-answer-1.1.1.zip).
 
 ![Номер правильного варианта рядом с квадратом](preview/answer.png)
 
@@ -43,7 +43,7 @@
 
 1. Скачайте репозиторий: `git clone https://github.com/dRammir/quick-answer.git`
    (или на GitHub нажмите **Code → Download ZIP** и распакуйте). Готовая сборка уже лежит в
-   `dist/deepseek-quick-answer-1.1.0.zip` — её тоже достаточно распаковать в отдельную папку.
+   `dist/deepseek-quick-answer-1.1.1.zip` — её тоже достаточно распаковать в отдельную папку.
 2. Откройте `chrome://extensions`.
 3. Включите **Режим разработчика** (справа сверху).
 4. Нажмите **Загрузить распакованное расширение** и выберите папку проекта
