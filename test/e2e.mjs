@@ -7,7 +7,7 @@
  *  - клик читает буфер, шлёт запрос и показывает только номер ответа;
  *  - несколько ответов показываются как «2, 4»;
  *  - буквенный ответ (B) превращается в номер 2;
- *  - ошибка API показывается незаметным «!» с подсказкой в title;
+ *  - ошибка API показывается компактным «!» с подсказкой в title;
  *  - номера автоматически исчезают;
  *  - offscreen-документ читает буфер;
  *  - режим вкладки chat.deepseek.com работает через мок-страницу чата.
@@ -346,9 +346,16 @@ async function main() {
     check('Страница настроек открывается', true);
     check('В настройках есть три режима', (await optionsPage.$$('input[name="mode"]')).length === 3);
 
-    await optionsPage.click('#apiKey');
-    await optionsPage.type('#apiKey', 'sk-e2e-test-key');
-    await optionsPage.click('#save');
+    // Программный ввод: мышиные клики Puppeteer по extension-странице иногда
+    // зависают в headless, хотя сама страница работает.
+    await optionsPage.evaluate(() => {
+      const input = document.getElementById('apiKey');
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+      setter.call(input, 'sk-e2e-test-key');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    await optionsPage.evaluate(() => document.getElementById('save').click());
     await sleep(500);
     const saved = await readSettings(optionsPage);
     check('Сохранение ключа из интерфейса', saved?.apiKey === 'sk-e2e-test-key', JSON.stringify(saved?.apiKey));
@@ -394,7 +401,7 @@ async function main() {
         Math.abs(initial.fab.gapBottom - 8) < 1,
       JSON.stringify({ width: initial.fab.width, height: initial.fab.height, right: initial.fab.gapRight, bottom: initial.fab.gapBottom }),
     );
-    check('Квадрат почти прозрачный в покое', initial.fab.opacity <= 0.3, `opacity=${initial.fab.opacity}`);
+    check('Квадрат ненавязчивый в покое', initial.fab.opacity <= 0.3, `opacity=${initial.fab.opacity}`);
     check('Большой панели больше нет', initial.hasPanel === false);
 
     const copied = await writeClipboard(page, QUESTION);
@@ -405,7 +412,7 @@ async function main() {
     await sleep(300);
     ui = await getUi(page);
     check('Один ответ показывается одним номером', ui.numbers.text === '2');
-    check('Номера тоже полупрозрачные', ui.numbers.opacity > 0 && ui.numbers.opacity <= 0.75, `opacity=${ui.numbers.opacity}`);
+    check('Номера отрисованы полупрозрачно', ui.numbers.opacity > 0 && ui.numbers.opacity <= 0.75, `opacity=${ui.numbers.opacity}`);
     check('После ответа нет всплывающей панели', ui.hasPanel === false);
 
     const apiRequest = await lastApiRequest(browser, extensionId);
@@ -455,7 +462,7 @@ async function main() {
     await stubFetch(browser, extensionId, { error: { message: 'Authentication Fails' } }, 401);
     await clickFab(page);
     ui = await waitUi(page, (state) => state.numbers.show && state.numbers.kind === 'error', 25_000, 'ошибка 401');
-    check('Ошибка 401 показывается незаметным «!»', ui.numbers.text === '!', ui.numbers.text);
+    check('Ошибка 401 показывается компактным «!»', ui.numbers.text === '!', ui.numbers.text);
     check('Текст ошибки доступен в подсказке', ui.fab.title.includes('Неверный API-ключ'), ui.fab.title.split('\n')[0]);
 
     await stubFetch(browser, extensionId, {

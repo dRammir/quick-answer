@@ -3,7 +3,7 @@
   "name": "DeepSeek Quick Answer",
   "short_name": "DS Quick",
   "version": "1.0.0",
-  "description": "Незаметный квадрат в углу сайта: берёт вопрос с вариантами из буфера обмена и показывает только номера правильных ответов DeepSeek.",
+  "description": "Помощник для сверки ответов: маленький квадрат в углу сайта отправляет вопрос из буфера в DeepSeek и показывает номер правильного варианта.",
   "minimum_chrome_version": "116",
   "permissions": ["storage", "clipboardRead", "offscreen", "tabs", "scripting"],
   "host_permissions": ["https://api.deepseek.com/*", "https://chat.deepseek.com/*"],
