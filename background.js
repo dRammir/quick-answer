@@ -286,6 +286,43 @@ async function restoreFocus(originTabId) {
   }
 }
 
+let pendingChatFocus = null;
+
+function scheduleChatFocusRestore(chatTabId, originTabId) {
+  if (!originTabId) return;
+  clearChatFocusPending(chatTabId, false);
+  const timer = setTimeout(() => {
+    restoreChatFocus(chatTabId);
+  }, 5_000);
+  pendingChatFocus = { chatTabId, originTabId, timer };
+}
+
+async function restoreChatFocus(chatTabId) {
+  if (!pendingChatFocus || pendingChatFocus.chatTabId !== chatTabId) return;
+  const pending = pendingChatFocus;
+  pendingChatFocus = null;
+  clearTimeout(pending.timer);
+
+  // Если пользователь уже сам переключился, не выдёргиваем его обратно.
+  try {
+    const tab = await chrome.tabs.get(chatTabId);
+    if (!tab.active) return;
+  } catch {
+    return;
+  }
+  await restoreFocus(pending.originTabId);
+}
+
+function clearChatFocusPending(chatTabId, restore) {
+  if (!pendingChatFocus || pendingChatFocus.chatTabId !== chatTabId) return;
+  if (restore) {
+    restoreChatFocus(chatTabId);
+    return;
+  }
+  clearTimeout(pendingChatFocus.timer);
+  pendingChatFocus = null;
+}
+
 async function findOrOpenChatTab(originTabId) {
   const tabs = (await chrome.tabs.query({ url: 'https://chat.deepseek.com/*' }))
     .filter((item) => isUsableChatUrl(item.url))
@@ -313,7 +350,7 @@ async function findOrOpenChatTab(originTabId) {
   const created = await chrome.tabs.create({ url: WEB_TAB_URL, active: true });
   try {
     const ready = await waitForTabComplete(created.id, 40_000);
-    await sleep(1_800); // даём React-приложению дорисовать редактор
+    await sleep(600); // редактор ещё подождёт bridge; вкладка мелькает короче
     return { tab: ready, restore: true };
   } catch (error) {
     await restoreFocus(originTabId);
@@ -342,13 +379,14 @@ async function sendToChatTab(tabId, message) {
 
 async function askViaWeb(settings, text, originTabId) {
   const { tab, restore } = await findOrOpenChatTab(originTabId);
+  if (restore) scheduleChatFocusRestore(tab.id, originTabId);
 
   try {
     const prompt = buildWebPrompt(text, settings.systemPrompt);
     let response;
     try {
       response = await withTimeout(
-        sendToChatTab(tab.id, { type: 'dsq-web-ask', prompt }),
+        sendToChatTab(tab.id, { type: 'dsq-web-ask', prompt, originTabId }),
         WEB_TIMEOUT_MS,
         'Веб-вкладка не ответила за 190 секунд. Проверьте, что вы вошли в chat.deepseek.com.',
       );
@@ -377,7 +415,7 @@ async function askViaWeb(settings, text, originTabId) {
     }
     return { content };
   } finally {
-    if (restore) await restoreFocus(originTabId);
+    if (restore) await restoreChatFocus(tab.id);
   }
 }
 
@@ -512,6 +550,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'dsq-read-clipboard':
       return reply(sendResponse, readClipboard().then((text) => ({ ok: true, text })));
+
+    case 'dsq-web-sent': {
+      const chatTabId = sender?.tab?.id;
+      if (chatTabId) restoreChatFocus(chatTabId);
+      sendResponse({ ok: true });
+      return false;
+    }
 
     case 'dsq-ask': {
       if (typeof message.text !== 'string') {
