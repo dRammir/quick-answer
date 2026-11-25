@@ -272,19 +272,25 @@
       return all
         .filter((node) => !all.some((other) => other !== node && other.contains(node)))
         .filter((node) => node.querySelector('p, li, pre, code, h1, h2, h3, table') || (node.innerText || '').trim())
-        .filter((node) => isVisible(node))
+        .filter((node) => isAnswerBlockVisible(node))
         .filter((node) => !isReasoningBlock(node))
         .map((node) => ({ node, text: (node.innerText || '').trim() }))
         .filter((item) => item.text.length > 0);
     }
 
     function isReasoningBlock(node) {
-      let current = node;
-      for (let depth = 0; depth < 5 && current; depth += 1, current = current.parentElement) {
-        const className = String(current.className || '');
-        if (/think|reason|reasoning/i.test(className)) return true;
-      }
-      return false;
+      // Исключаем только реальные контейнеры рассуждений, а не любой
+      // родитель с «reason»/«think» в имени класса.
+      return Boolean(
+        node.closest(
+          '.ds-think-content, [class*="think-content"], [class*="think_block"], [class*="reasoning-content"]',
+        ),
+      );
+    }
+
+    function isAnswerBlockVisible(node) {
+      const style = getComputedStyle(node);
+      return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
     }
 
     /** Кнопка «Stop» / «Остановить» видна, пока DeepSeek печатает. */
@@ -305,7 +311,63 @@
     function isEcho(text, prompt) {
       const normalizedText = text.replace(/\s+/g, ' ').trim();
       const normalizedPrompt = prompt.replace(/\s+/g, ' ').trim();
-      return normalizedText.length > 0 && normalizedPrompt.startsWith(normalizedText.slice(0, 40));
+      if (!normalizedText) return false;
+      const promptPrefix = normalizedPrompt.slice(0, 60);
+      return (
+        normalizedText.startsWith(promptPrefix) ||
+        normalizedText.includes(promptPrefix) ||
+        normalizedPrompt.startsWith(normalizedText.slice(0, 40))
+      );
+    }
+
+    /** Последний «ОТВЕТ: …» на странице после последнего сообщения пользователя. */
+    function findAnswerInPage(prompt, baseline) {
+      const userNodes = Array.from(
+        document.querySelectorAll(
+          '[data-message-author-role="user"], [class*="UserMessage"], .user-message',
+        ),
+      );
+      const lastUser = userNodes[userNodes.length - 1] || null;
+
+      const selectors = [
+        '[data-message-author-role="assistant"]',
+        'div.ds-markdown.ds-markdown--block',
+        'div.ds-markdown',
+        '[class*="ds-markdown"]',
+        '[class*="markdown"]',
+      ];
+      const seen = new Set();
+
+      for (const selector of selectors) {
+        const nodes = Array.from(document.querySelectorAll(selector)).slice(-40);
+        for (let index = nodes.length - 1; index >= 0; index -= 1) {
+          const node = nodes[index];
+          if (seen.has(node)) continue;
+          seen.add(node);
+
+          if (
+            lastUser &&
+            !(lastUser.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)
+          ) {
+            continue;
+          }
+
+          const text = (node.innerText || '').trim();
+          if (!text || text.length > 12_000) continue;
+          if (isEcho(text, prompt)) continue;
+          if (baseline?.texts?.has(text)) continue;
+
+          const matches = [
+            ...text.matchAll(
+              /(?:ОТВЕТ|ANSWER)\s*[:：\-–—]\s*(?:вариант\s+)?([A-Za-zА-Яа-я]|\d{1,2}(?:\s*[,;·]\s*\d{1,2})*)/gi,
+            ),
+          ];
+          if (!matches.length) continue;
+          const value = matches[matches.length - 1][1].trim();
+          if (value) return `ОТВЕТ: ${value}`;
+        }
+      }
+      return '';
     }
 
     async function waitForAnswer(baseline, prompt, timeoutMs) {
@@ -313,10 +375,23 @@
       let lastText = '';
       let stableSince = 0;
       let sawFresh = false;
+      let patternText = '';
+      let patternSince = 0;
+      let lastDebugAt = 0;
       debug('waiting-answer', { baseline: baseline.count });
 
       while (Date.now() - started < timeoutMs) {
         const blocks = collectAssistantBlocks();
+        const pageAnswer = findAnswerInPage(prompt, baseline);
+        if (pageAnswer) {
+          if (pageAnswer !== patternText) {
+            patternText = pageAnswer;
+            patternSince = Date.now();
+          } else if (Date.now() - patternSince >= 1_500) {
+            debug('answer-pattern', { chars: pageAnswer.length });
+            return pageAnswer;
+          }
+        }
         // Новый блок — либо появился после уже существовавших, либо его текста
         // не было в истории (переживает перерисовку и виртуализацию списка).
         const fresh = blocks.filter(
@@ -340,6 +415,17 @@
           debug('answer-ready', { chars: lastText.length });
           return lastText;
         }
+
+        if (!sawFresh && Date.now() - started > 5_000 && Date.now() - lastDebugAt > 5_000) {
+          lastDebugAt = Date.now();
+          debug('dom-snapshot', {
+            markdown: document.querySelectorAll('.ds-markdown').length,
+            markdownLike: document.querySelectorAll('[class*="markdown"]').length,
+            assistant: document.querySelectorAll('[data-message-author-role="assistant"]').length,
+            collected: blocks.length,
+            pattern: Boolean(pageAnswer),
+          });
+        }
         await sleep(400);
       }
 
@@ -349,7 +435,7 @@
       }
       debug('timeout', { blocks: collectAssistantBlocks().length });
       throw errorWithCode(
-        'DeepSeek не прислал ответ за 150 секунд. Проверьте, что вопрос появился в чате, вы вошли в аккаунт и сайт не показывает проверку.',
+        'DeepSeek не прислал ответ за 180 секунд. Проверьте, что вопрос появился в чате, вы вошли в аккаунт и сайт не показывает проверку.',
         'WEB_TIMEOUT',
       );
     }
@@ -395,7 +481,7 @@
         debug('inserted', { tag: editor.tagName, chars: (editor.value || editor.innerText || '').length });
         await sleep(300);
         await submitPrompt(editor);
-        return await waitForAnswer(baseline, prompt, 140_000);
+        return await waitForAnswer(baseline, prompt, 180_000);
       } finally {
         busy = false;
       }

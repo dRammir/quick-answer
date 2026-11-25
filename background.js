@@ -11,7 +11,7 @@ import {
 
 const SETTINGS_KEY = 'dsq_settings';
 const API_TIMEOUT_MS = 120_000;
-const WEB_TIMEOUT_MS = 150_000;
+const WEB_TIMEOUT_MS = 190_000;
 const WEB_TAB_URL = 'https://chat.deepseek.com/';
 
 /* ------------------------------------------------------------------ */
@@ -350,7 +350,7 @@ async function askViaWeb(settings, text, originTabId) {
       response = await withTimeout(
         sendToChatTab(tab.id, { type: 'dsq-web-ask', prompt }),
         WEB_TIMEOUT_MS,
-        'Веб-вкладка не ответила за 150 секунд. Проверьте, что вы вошли в chat.deepseek.com.',
+        'Веб-вкладка не ответила за 190 секунд. Проверьте, что вы вошли в chat.deepseek.com.',
       );
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
