@@ -456,7 +456,7 @@
           const text = (node.innerText || '').trim();
           if (!text || text.length > 12_000) continue;
           if (isEcho(text, prompt)) continue;
-          if (baseline?.texts?.has(text)) continue;
+          if (!lastUser && baseline?.texts?.has(text)) continue;
 
           const matches = [
             ...text.matchAll(
@@ -505,7 +505,7 @@
           const text = (node.innerText || '').trim();
           if (!text || text.length > 3_000) continue;
           if (isEcho(text, prompt)) continue;
-          if (baseline?.texts?.has(text)) continue;
+          if (!lastUser && baseline?.texts?.has(text)) continue;
           if (/^(?:copy|retry|edit|share|like|dislike|regenerate|копировать|повторить|изменить)$/i.test(text)) {
             continue;
           }
@@ -520,7 +520,7 @@
       return candidates.length ? candidates[candidates.length - 1].text : '';
     }
 
-    async function waitForAnswer(baseline, prompt, timeoutMs, editor) {
+    async function waitForAnswer(baseline, prompt, timeoutMs) {
       const started = Date.now();
       let lastText = '';
       let stableSince = 0;
@@ -540,17 +540,8 @@
           if (pageAnswer !== patternText) {
             patternText = pageAnswer;
             patternSince = Date.now();
-          } else if (
-            (Date.now() - patternSince >= 2_000 &&
-              isPageIdle() &&
-              !isComposerBusy(editor)) ||
-            Date.now() - patternSince >= 20_000
-          ) {
-            debug('answer-pattern', {
-              chars: pageAnswer.length,
-              pageIdle: isPageIdle(),
-              emergency: Date.now() - patternSince >= 20_000,
-            });
+          } else if (Date.now() - patternSince >= 1_500) {
+            debug('answer-pattern', { chars: pageAnswer.length });
             return pageAnswer;
           }
         }
@@ -573,12 +564,8 @@
         }
 
         const stableFor = Date.now() - stableSince;
-        if (
-          sawFresh &&
-          lastText &&
-          ((stableFor >= 2_500 && isPageIdle() && !isComposerBusy(editor)) || stableFor >= 20_000)
-        ) {
-          debug('answer-ready', { chars: lastText.length, pageIdle: isPageIdle() });
+        if (sawFresh && lastText && ((!isGenerating() && stableFor >= 2_500) || stableFor >= 8_000)) {
+          debug('answer-ready', { chars: lastText.length });
           return lastText;
         }
 
@@ -588,17 +575,8 @@
             if (candidate !== fallbackText) {
               fallbackText = candidate;
               fallbackSince = Date.now();
-            } else if (
-              (Date.now() - fallbackSince >= 2_500 &&
-                isPageIdle() &&
-                !isComposerBusy(editor)) ||
-              Date.now() - fallbackSince >= 20_000
-            ) {
-              debug('answer-fallback-text', {
-                chars: candidate.length,
-                pageIdle: isPageIdle(),
-                emergency: Date.now() - fallbackSince >= 20_000,
-              });
+            } else if (Date.now() - fallbackSince >= 2_500) {
+              debug('answer-fallback-text', { chars: candidate.length });
               return candidate;
             }
           }
@@ -680,7 +658,7 @@
         await sleep(300);
         const sent = await submitPrompt(editor, prompt);
         // Если отправку не подтвердили, ждём меньше: вероятно, сообщение не ушло.
-        return await waitForAnswer(baseline, prompt, sent ? 180_000 : 60_000, editor);
+        return await waitForAnswer(baseline, prompt, sent ? 90_000 : 60_000);
       } finally {
         busy = false;
       }
