@@ -118,6 +118,12 @@
       return !(editor.innerText || '').trim();
     }
 
+    function countUserMessages() {
+      return document.querySelectorAll(
+        '[data-message-author-role="user"], [class*="UserMessage"], .user-message',
+      ).length;
+    }
+
     function findSendButton(editor) {
       const rect = editor.getBoundingClientRect();
       const all = Array.from(document.querySelectorAll('button, div[role="button"]'));
@@ -225,7 +231,11 @@
       throw errorWithCode('Поле ввода DeepSeek имеет неизвестный формат.', 'WEB_EDITOR');
     }
 
-    async function submitPrompt(editor) {
+    async function submitPrompt(editor, prompt) {
+      const baselineUsers = countUserMessages();
+      const promptPrefix = prompt.replace(/\s+/g, ' ').slice(0, 40);
+      let clicked = false;
+
       const button = findSendButton(editor);
       if (button) {
         debug('send-button', {
@@ -234,24 +244,52 @@
           label: `${button.getAttribute('aria-label') || ''} ${button.getAttribute('title') || ''}`.trim(),
         });
         await waitFor(() => !isDisabled(button), 5_000);
-        button.click();
+        if (isDisabled(button)) {
+          debug('send-enter-disabled');
+          pressEnter(editor);
+        } else {
+          button.click();
+          clicked = true;
+        }
       } else {
         debug('send-enter');
         pressEnter(editor);
       }
 
-      let cleared = await waitFor(() => isEditorEmpty(editor), 5_000);
-      if (!cleared) {
+      // DeepSeek может отправлять сообщение, но оставлять текст в поле ввода.
+      // Поэтому не считаем «поле не очистилось» ошибкой: ищем другие признаки.
+      let lastBodyCheck = 0;
+      const sentIndicator = () => {
+        if (isEditorEmpty(editor)) return 'editor-clear';
+        if (isGenerating()) return 'generating';
+        if (countUserMessages() > baselineUsers) return 'user-message';
+        if (Date.now() - lastBodyCheck > 1_000) {
+          lastBodyCheck = Date.now();
+          if ((document.body?.innerText || '').replace(/\s+/g, ' ').includes(promptPrefix)) {
+            return 'prompt-visible';
+          }
+        }
+        return '';
+      };
+
+      const confirmed = await waitFor(() => sentIndicator() || null, 8_000, 250);
+      if (confirmed) {
+        debug('sent', { via: confirmed });
+        return true;
+      }
+
+      // Кнопку не нашли и отправляли Enter — пробуем ещё раз один раз.
+      if (!clicked) {
         pressEnter(editor);
-        cleared = await waitFor(() => isEditorEmpty(editor), 3_000);
+        const retry = await waitFor(() => sentIndicator() || null, 4_000, 250);
+        if (retry) {
+          debug('sent', { via: `retry:${retry}` });
+          return true;
+        }
       }
-      if (!cleared) {
-        throw errorWithCode(
-          'Вопрос вставился, но не отправился. Откройте chat.deepseek.com и отправьте его вручную, затем повторите.',
-          'WEB_SUBMIT',
-        );
-      }
-      debug('sent');
+
+      debug('send-unconfirmed', { clicked, editorEmpty: isEditorEmpty(editor) });
+      return false;
     }
 
     function collectAssistantBlocks() {
@@ -370,6 +408,55 @@
       return '';
     }
 
+    /** Последний новый блок ассистента — на случай нестандартного формата ответа. */
+    function findFallbackAnswerText(prompt, baseline) {
+      const userNodes = Array.from(
+        document.querySelectorAll(
+          '[data-message-author-role="user"], [class*="UserMessage"], .user-message',
+        ),
+      );
+      const lastUser = userNodes[userNodes.length - 1] || null;
+      const selectors = [
+        '[data-message-author-role="assistant"]',
+        'div.ds-markdown.ds-markdown--block',
+        'div.ds-markdown',
+        '[class*="ds-markdown"]',
+      ];
+      const candidates = [];
+      const seen = new Set();
+
+      for (const selector of selectors) {
+        const nodes = Array.from(document.querySelectorAll(selector)).slice(-40);
+        for (const node of nodes) {
+          if (seen.has(node)) continue;
+          seen.add(node);
+          if (
+            lastUser &&
+            !(lastUser.compareDocumentPosition(node) & Node.DOCUMENT_POSITION_FOLLOWING)
+          ) {
+            continue;
+          }
+          if (node.closest('.ds-think-content, [class*="think-content"], [class*="reasoning-content"]')) {
+            continue;
+          }
+          const text = (node.innerText || '').trim();
+          if (!text || text.length > 3_000) continue;
+          if (isEcho(text, prompt)) continue;
+          if (baseline?.texts?.has(text)) continue;
+          if (/^(?:copy|retry|edit|share|like|dislike|regenerate|копировать|повторить|изменить)$/i.test(text)) {
+            continue;
+          }
+          candidates.push({ node, text });
+        }
+      }
+
+      candidates.sort((a, b) => {
+        const relation = a.node.compareDocumentPosition(b.node);
+        return relation & Node.DOCUMENT_POSITION_FOLLOWING ? 1 : -1;
+      });
+      return candidates.length ? candidates[candidates.length - 1].text : '';
+    }
+
     async function waitForAnswer(baseline, prompt, timeoutMs) {
       const started = Date.now();
       let lastText = '';
@@ -377,6 +464,8 @@
       let sawFresh = false;
       let patternText = '';
       let patternSince = 0;
+      let fallbackText = '';
+      let fallbackSince = 0;
       let lastDebugAt = 0;
       debug('waiting-answer', { baseline: baseline.count });
 
@@ -416,6 +505,19 @@
           return lastText;
         }
 
+        if (Date.now() - started > 8_000) {
+          const candidate = findFallbackAnswerText(prompt, baseline);
+          if (candidate) {
+            if (candidate !== fallbackText) {
+              fallbackText = candidate;
+              fallbackSince = Date.now();
+            } else if (Date.now() - fallbackSince >= 2_500) {
+              debug('answer-fallback-text', { chars: candidate.length });
+              return candidate;
+            }
+          }
+        }
+
         if (!sawFresh && Date.now() - started > 5_000 && Date.now() - lastDebugAt > 5_000) {
           lastDebugAt = Date.now();
           debug('dom-snapshot', {
@@ -435,7 +537,7 @@
       }
       debug('timeout', { blocks: collectAssistantBlocks().length });
       throw errorWithCode(
-        'DeepSeek не прислал ответ за 180 секунд. Проверьте, что вопрос появился в чате, вы вошли в аккаунт и сайт не показывает проверку.',
+        'DeepSeek не прислал ответ. Проверьте, что вопрос появился в чате, вы вошли в аккаунт и сайт не показывает проверку.',
         'WEB_TIMEOUT',
       );
     }
@@ -480,8 +582,9 @@
         await insertPrompt(editor, prompt);
         debug('inserted', { tag: editor.tagName, chars: (editor.value || editor.innerText || '').length });
         await sleep(300);
-        await submitPrompt(editor);
-        return await waitForAnswer(baseline, prompt, 180_000);
+        const sent = await submitPrompt(editor, prompt);
+        // Если отправку не подтвердили, ждём меньше: вероятно, сообщение не ушло.
+        return await waitForAnswer(baseline, prompt, sent ? 180_000 : 60_000);
       } finally {
         busy = false;
       }

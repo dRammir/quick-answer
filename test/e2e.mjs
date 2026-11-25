@@ -68,7 +68,8 @@ const MOCK_CHAT_HTML = `<!doctype html>
   send.addEventListener('click', () => {
     const value = input.value.trim();
     if (!value) return;
-    input.value = '';
+    // Специально не очищаем input: проверяем, что расширение не считает
+    // отправку неудачной, если DeepSeek оставил текст в поле ввода.
     const box = document.createElement('div');
     box.className = 'ds-markdown';
     messages.appendChild(box);
